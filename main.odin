@@ -186,8 +186,18 @@ update_camera :: proc(state: ^AppState, delta: f32) {
     state.camera.target = state.camera.pos + forward
 }
 
+calculate_triangle_normal :: proc(tri: Triangle) -> Vec3 {
+    a := tri.p.y - tri.p.x
+    b := tri.p.z - tri.p.x
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    }
+}
+
 main :: proc() {
-    triangles := generate_grid({20,3,20}, 1)
+    triangles := generate_grid({20,5,20}, 1)
     // triangles := make_test_grid()
 
     sdl.SetLogPriorities(.VERBOSE)
@@ -232,6 +242,18 @@ main :: proc() {
         num_levels = 1,
     }) 
 
+
+    win_size: [2]i32
+    sdl.GetWindowSize(window, &win_size[0], &win_size[1])
+    depth_texture := sdl.CreateGPUTexture(gpu, {
+        format = .D16_UNORM,
+        usage = {.DEPTH_STENCIL_TARGET},
+        width = u32(win_size.x),
+        height = u32(win_size.y),
+        layer_count_or_depth = 1,
+        num_levels = 1,
+    }) 
+
     frag_shader := sdl.CreateGPUShader(gpu, {
         code_size = len(frag_shader_code),
         code = raw_data(frag_shader_code),
@@ -240,6 +262,7 @@ main :: proc() {
         format = {.MSL},
         stage = .FRAGMENT,
         num_samplers = 1,
+        num_uniform_buffers = 1,
     })
 
     vert_shader := sdl.CreateGPUShader(gpu, {
@@ -255,6 +278,7 @@ main :: proc() {
         pos: Vec3,
         color: sdl.FColor,
         uv: [2]int,
+        normal: Vec3,
     }
     WHITE :: sdl.FColor{1,1,1,1} 
     vertices := [dynamic]Vertex_Data{}
@@ -268,10 +292,12 @@ main :: proc() {
             case 2: uv[1] = 1
             case: panic("unacceptable")
             }
+            normal := calculate_triangle_normal(triangle)
             append_elem(&vertices, Vertex_Data {
                 pos = pos,
                 color = {1,1,1,1},
                 uv = uv,
+                normal = normal,
             })
         }
     }
@@ -286,7 +312,6 @@ main :: proc() {
     indices_byte_size := len(indices) * size_of(indices[0])
 
     fmt.println(len(vertices), len(indices))
-    fmt.println(len(vertices) / 3, len(indices) / 3)
 
     index_buf := sdl.CreateGPUBuffer(gpu, {
         usage = {.INDEX},
@@ -365,6 +390,11 @@ main :: proc() {
             format = .FLOAT2,
             offset = u32(offset_of(Vertex_Data, uv)),
         },
+        {
+            location = 3,
+            format = .FLOAT3,
+            offset = u32(offset_of(Vertex_Data, normal)),
+        },
     }
 
     pipeline := sdl.CreateGPUGraphicsPipeline(gpu, {
@@ -375,7 +405,9 @@ main :: proc() {
             num_color_targets = 1,
             color_target_descriptions = &(sdl.GPUColorTargetDescription{
                 format = sdl.GetGPUSwapchainTextureFormat(gpu, window)
-            })
+            }),
+            has_depth_stencil_target = true,
+            depth_stencil_format = .D16_UNORM,
         },
         vertex_input_state = {
             num_vertex_buffers = 1,
@@ -385,6 +417,11 @@ main :: proc() {
             }),
             num_vertex_attributes = u32(len(vertex_attributes)),
             vertex_attributes = raw_data(vertex_attributes),
+        },
+        depth_stencil_state = {
+            enable_depth_test = true,
+            enable_depth_write = true,
+            compare_op = .LESS,
         },
     })
 
@@ -400,8 +437,11 @@ main :: proc() {
     rotation := f32(0)
     proj_mat := linalg.matrix4_perspective_f32(linalg.to_radians(f32(70)), aspect, 0.0001, 1000.)
 
+    // I'm sending each matrix separately so the shaders can do lighting stuff
     UBO :: struct #max_field_align(16) {
-        mvp: matrix[4, 4]f32,
+        projection: matrix[4, 4]f32,
+        view: matrix[4, 4]f32,
+        model: matrix[4, 4]f32,
     }
 
     last_ticks := sdl.GetTicks()
@@ -443,7 +483,18 @@ main :: proc() {
         view_mat := linalg.matrix4_look_at_f32(state.camera.pos, state.camera.target, {0,1,0})
 
         ubo := UBO{
-            mvp = proj_mat * view_mat * model_mat,
+            projection = proj_mat,
+            view = view_mat,
+            model = model_mat,
+        }
+
+        ShaderConsts :: struct #max_field_align(16) {
+            light_pos: Vec3,
+            view_pos: Vec3,
+        }
+        consts := ShaderConsts {
+            light_pos = {20,20,0},
+            view_pos = state.camera.pos,
         }
 
         if swap_texture == nil {
@@ -458,13 +509,29 @@ main :: proc() {
             texture = swap_texture,
         }
 
-        render_pass := sdl.BeginGPURenderPass(cmd_buf, &color_target_info, 1, nil)
+        depth_target_info := sdl.GPUDepthStencilTargetInfo{
+            texture = depth_texture,
+            load_op = .CLEAR,
+            clear_depth = 1,
+            store_op = .DONT_CARE,
+        }
+
+        render_pass := sdl.BeginGPURenderPass(
+             cmd_buf,
+             &color_target_info,
+             1,
+             &depth_target_info
+        )
+
         sdl.BindGPUGraphicsPipeline(render_pass, pipeline)
         sdl.BindGPUVertexBuffers(render_pass, 0, &(sdl.GPUBufferBinding{
             buffer = vertex_buf,
             offset = 0,
         }), 1)
+
         sdl.PushGPUVertexUniformData(cmd_buf, 0, &ubo, size_of(ubo))
+        sdl.PushGPUFragmentUniformData(cmd_buf, 0, &consts, size_of(consts))
+
         sdl.BindGPUIndexBuffer(render_pass, { buffer = index_buf }, ._16BIT)
         sdl.BindGPUFragmentSamplers(
             render_pass,
@@ -476,7 +543,7 @@ main :: proc() {
             1
         )
         // sdl.DrawGPUPrimitives(render_pass, 6, 1, 0, 0)
-        sdl.DrawGPUIndexedPrimitives(render_pass, u32(len(vertices)), 1, 0, 0, 0)
+        sdl.DrawGPUIndexedPrimitives(render_pass, u32(len(indices)), 1, 0, 0, 0)
         sdl.EndGPURenderPass(render_pass)
 
         handle_err(sdl.SubmitGPUCommandBuffer(cmd_buf))
